@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 import re
+import sys
+from typing import Generator, Iterator
 
 # Third Party
 from datasets import Dataset
+
+from openai import Completion
 
 # Local
 from .block import Block
@@ -61,49 +65,115 @@ class LLMBlock(Block):
 
         return matches
 
-    def _generate(self, samples, **gen_kwargs) -> list:
+    def _generate(self, samples, **gen_kwargs) -> Iterator[Completion]:
         prompts = [
             self.model_prompt.format(
                 prompt=self.prompt_template.format(**sample).strip()
             )
             for sample in samples
         ]
-        response = self.client.completions.create(
-            prompt=prompts, **{**self.defaults, **gen_kwargs}
+        return self.client.completions.create(
+            prompt=prompts, stream=True, **{**self.defaults, **gen_kwargs}
         )
-        return [choice.text.strip() for choice in response.choices]
 
-    def generate(self, samples, **gen_kwargs) -> Dataset:
+
+#        return [choice.text.strip() for choice in response.choices]
+
+
+    def generate(self, samples: Dataset, **gen_kwargs) -> Iterator[Dataset]:
         """
         Generate the output from the block. This method should first validate the input data,
         then generate the output, and finally parse the generated output before returning it.
 
         :return: The parsed output after generation.
         """
+        num_inputs = len(samples)
+
         num_samples = self.batch_params.get("num_samples", None)
-        batched = self.batch_params.get("batched", False)
 
         if (num_samples is not None) and ("num_samples" not in samples.column_names):
-            samples = samples.add_column("num_samples", [num_samples] * len(samples))
+            samples = samples.add_column("num_samples", [num_samples] * num_inputs)
 
         # validate the each sample
         for sample in samples:
             if not self._validate(self.prompt_template, sample):
+                #TODO log and discard
                 return None
 
         # generate the output
-        outputs = []
-        if batched:
-            outputs = self._generate(samples, **gen_kwargs)
-        else:
-            outputs = [self._generate([sample], **gen_kwargs) for sample in samples]
+        stream = self._generate(samples, **gen_kwargs)
 
-        new_data = []
-        for sample, output in zip(samples, outputs):
-            parsed_outputs = self._parse(output)
-            # pylint: disable=consider-using-generator
-            max_length = max([len(value) for value in parsed_outputs.values()])
-            for values in zip(*(lst[:max_length] for lst in parsed_outputs.values())):
-                new_data.append({**sample, **dict(zip(parsed_outputs.keys(), values))})
+        col_specs = list(zip(
+            self.block_config["start_tags"],
+            self.block_config["end_tags"],
+            self.output_cols,
+        ))
 
-        return Dataset.from_list(new_data)
+        output_text = [""] * num_inputs
+        sent_up_to = [0] * num_inputs
+        if num_samples is None:
+            num_samples = sys.maxsize
+        remaining = [num_samples] * num_inputs
+
+        # [ ([],[]), ([],[]) ]
+        outputs = [tuple([] for _ in col_specs) for _ in range(num_inputs)]
+
+        try:
+            for chunk in stream:
+                choice = chunk.choices[0]
+                sample_index = choice.index
+                if not remaining[sample_index]:
+                    continue
+
+                text = output_text[sample_index] + choice.text
+                output_text[sample_index] = text
+
+                start_index = sent_up_to[sample_index]
+
+                for i, (start_tag, end_tag, col_name) in enumerate(col_specs):
+
+                    end_tag_idx = text.rfind(end_tag, start_index)
+                    if end_tag_idx != -1:
+                        start_tag_idx = text.rfind(start_tag, start_index, end_tag_idx)
+                        if start_tag_idx == -1:
+                            #TODO could log warning here
+                            pass
+                        else:
+                            output = text[start_tag_idx + len(start_tag): end_tag_idx].strip()
+                            sent_up_to[sample_index] = end_tag_idx + len(end_tag)
+
+                            buckets = outputs[sample_index]
+                            buckets[i].append(output)
+
+                            if all(buckets):
+                                out_texts = (bucket.pop(0) for bucket in buckets)
+                                #TODO simplify
+                                print(f"Sending dataset for index {sample_index}: {out_texts}")
+                                dataset = Dataset.from_list([{
+                                    **samples[sample_index], **dict(zip(self.output_cols, out_texts))
+                                }])
+
+                                yield dataset
+
+                                remaining[sample_index] -= 1
+                                if not any(remaining):
+                                    break
+
+        finally:
+            # Ensure we abort to free up model server resources
+            stream.close()
+
+
+            #TODO finish reason
+
+
+        # new_data = []
+        # for sample, output in zip(samples, outputs):
+        #     parsed_outputs: Dict[str, List[str]] = self._parse(output)
+        #     # pylint: disable=consider-using-generator
+        #     max_length = max([len(value) for value in parsed_outputs.values()])
+        #     for values in zip(*(lst[:max_length] for lst in parsed_outputs.values())):
+        #         new_data.append({**sample, **dict(zip(parsed_outputs.keys(), values))})
+        #
+        # Dataset.from
+        # return Dataset.from_list(new_data)
