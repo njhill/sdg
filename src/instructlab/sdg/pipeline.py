@@ -89,6 +89,9 @@ class Pipeline:
         next_index = index + 1
         finished = next_index == len(self.chained_blocks)
         for dataset in next_datasets:
+            if not len(dataset):
+                continue
+
             if drop_columns:
                 drop_columns = [col for col in drop_columns if col in dataset.column_names]
                 dataset = dataset.remove_columns(drop_columns)

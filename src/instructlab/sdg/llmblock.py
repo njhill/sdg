@@ -65,7 +65,7 @@ class LLMBlock(Block):
 
         return matches
 
-    def _generate(self, samples, **gen_kwargs) -> Iterator[Completion]:
+    def _generate(self, samples, **gen_kwargs) -> Generator[Completion, None, None]:
         prompts = [
             self.model_prompt.format(
                 prompt=self.prompt_template.format(**sample).strip()
@@ -89,6 +89,10 @@ class LLMBlock(Block):
         """
         num_inputs = len(samples)
 
+        if not num_inputs:
+            logger.warn("ENCOUNTERED EMPTY DATASET!!")
+            return []
+
         num_samples = self.batch_params.get("num_samples", None)
 
         if (num_samples is not None) and ("num_samples" not in samples.column_names):
@@ -97,8 +101,8 @@ class LLMBlock(Block):
         # validate the each sample
         for sample in samples:
             if not self._validate(self.prompt_template, sample):
-                #TODO log and discard
-                return None
+                logger.warn("SAMPLE FAILED VALIDATION")
+                return []
 
         # generate the output
         stream = self._generate(samples, **gen_kwargs)
@@ -136,7 +140,7 @@ class LLMBlock(Block):
                     if end_tag_idx != -1:
                         start_tag_idx = text.rfind(start_tag, start_index, end_tag_idx)
                         if start_tag_idx == -1:
-                            #TODO could log warning here
+                            logger.warn(f"Encountered end tag {end_tag} without corresponding start tag")
                             pass
                         else:
                             output = text[start_tag_idx + len(start_tag): end_tag_idx].strip()
@@ -146,9 +150,9 @@ class LLMBlock(Block):
                             buckets[i].append(output)
 
                             if all(buckets):
-                                out_texts = (bucket.pop(0) for bucket in buckets)
+                                out_texts = [bucket.pop(0) for bucket in buckets]
                                 #TODO simplify
-                                print(f"Sending dataset for index {sample_index}: {out_texts}")
+                                print(f"Sending dataset for index {sample_index}: {list(out_texts)}")
                                 dataset = Dataset.from_list([{
                                     **samples[sample_index], **dict(zip(self.output_cols, out_texts))
                                 }])
